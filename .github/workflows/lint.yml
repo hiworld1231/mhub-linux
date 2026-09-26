@@ -25,3 +25,4 @@ jobs:
           node --check tools/sdk-trace.mjs
           node --check tools/ui-diagnose.mjs
           node --check tools/ui-fix-live.mjs
+          node --check tools/window-fix-live.mjs
