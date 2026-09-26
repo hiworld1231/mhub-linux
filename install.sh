@@ -49,17 +49,6 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
-need_sudo() {
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    printf ''
-  elif have sudo; then
-    printf 'sudo'
-  else
-    printf 'mhub-linux: sudo is required to install missing system packages.\n' >&2
-    exit 1
-  fi
-}
-
 install_packages() {
   local missing=()
   local cmd
@@ -77,18 +66,25 @@ install_packages() {
     exit 1
   fi
 
-  local sudo_cmd
-  sudo_cmd="$(need_sudo)"
+  local -a elevate=()
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if have sudo; then
+      elevate=(sudo)
+    else
+      printf 'mhub-linux: sudo is required to install missing system packages.\n' >&2
+      exit 1
+    fi
+  fi
 
   say "Installing runtime packages"
 
   if have pacman; then
-    $sudo_cmd pacman -S --needed --noconfirm wine nodejs npm curl unzip
+    "${elevate[@]}" pacman -S --needed --noconfirm wine nodejs npm curl unzip
   elif have apt-get; then
-    $sudo_cmd apt-get update
-    $sudo_cmd apt-get install -y wine64 nodejs npm curl unzip
+    "${elevate[@]}" apt-get update
+    "${elevate[@]}" apt-get install -y wine64 nodejs npm curl unzip
   elif have dnf; then
-    $sudo_cmd dnf install -y wine nodejs npm curl unzip
+    "${elevate[@]}" dnf install -y wine nodejs npm curl unzip
   else
     printf 'Unsupported package manager. Install these commands manually:\n' >&2
     printf '  wine wineserver node npm curl unzip\n' >&2
@@ -147,6 +143,7 @@ download_fonts() {
   local icon_base="https://cdn.mchose.com.cn/customPage/iconfont"
   local icon_ref="iconfont.woff2"
   local css
+  local resolved=""
 
   if css="$(curl -fsSL --retry 3 "$icon_css_url")"; then
     resolved="$(printf '%s' "$css" | grep -oE 'iconfont\.woff2[^\")[:space:]]*' | head -n 1 || true)"
@@ -184,7 +181,7 @@ install_hub() {
   existing="$(find_installed_app || true)"
   if [[ "$SKIP_HUB" -eq 1 ]]; then
     if [[ -z "$existing" ]]; then
-      printf '--skip-hub was requested, but MCHOSE HUB.exe is not installed in %s\n' "$PREFIX" >&2
+      printf '%s\n' "--skip-hub was requested, but MCHOSE HUB.exe is not installed in $PREFIX" >&2
       exit 1
     fi
     return 0
@@ -228,7 +225,7 @@ install_hub() {
   installed="$(find_installed_app || true)"
   if [[ -z "$installed" ]]; then
     printf 'The installer finished, but MCHOSE HUB.exe was not found in the Wine prefix.\n' >&2
-    printf 'Rerun with WINEDEBUG=fixme-all for Wine diagnostics if needed.\n' >&2
+    printf 'Run the installer manually in the same prefix for Wine diagnostics if needed.\n' >&2
     exit 1
   fi
 
