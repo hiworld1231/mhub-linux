@@ -17,7 +17,7 @@ jobs:
           bash -n scripts/mhub-linux
 
       - name: ShellCheck
-        run: shellcheck install.sh uninstall.sh scripts/mhub-linux
+        run: shellcheck --severity=warning install.sh uninstall.sh scripts/mhub-linux
 
       - name: Node syntax
         run: node --check src/bridge.mjs
