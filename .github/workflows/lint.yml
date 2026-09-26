@@ -1,0 +1,23 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n scripts/mhub-linux
+
+      - name: ShellCheck
+        run: shellcheck install.sh uninstall.sh scripts/mhub-linux
+
+      - name: Node syntax
+        run: node --check src/bridge.mjs
