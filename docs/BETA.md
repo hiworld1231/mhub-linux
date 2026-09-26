@@ -11,16 +11,40 @@ The beta work has two stages:
 
 ## Capture V9 Pro SDK traffic
 
-Start M HUB normally with `mhub-linux`, but do not open the V9 Pro page yet.
+The tracer does **not** launch M HUB. Start M HUB first, leave the V9 Pro page closed, then start the tracer in a second terminal.
 
-From a clone of this branch:
+### Using an existing Wine prefix
+
+If M HUB is already installed in a prefix such as `~/.wine-mchose-test`, install the beta runtime without reinstalling M HUB:
 
 ```bash
 git clone -b beta https://github.com/hiworld1231/mhub-linux.git
 cd mhub-linux
-npm install
+MHUB_PREFIX="$HOME/.wine-mchose-test" ./install.sh --skip-hub --skip-packages
+```
+
+Start M HUB:
+
+```bash
+MHUB_PREFIX="$HOME/.wine-mchose-test" mhub-linux
+```
+
+Wait until the main M HUB window is visible. Do not open V9 Pro yet.
+
+In a second terminal:
+
+```bash
+cd ~/mhub-linux
 node tools/sdk-trace.mjs --output v9-pro-sdk.jsonl
 ```
+
+A fresh session should normally print:
+
+```text
+[sdk-trace] hook: installed
+```
+
+`already-installed` means a trace hook is already present in the currently running M HUB main process, usually because a previous tracer session attached to the same process. Stop M HUB and start a fresh session if the window is missing or the state is unclear.
 
 Leave the tracer running. Open V9 Pro and change one control at a time. Wait about a second between changes so the resulting trace is easy to read.
 
