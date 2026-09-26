@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_ROOT="${MHUB_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/mhub-linux}"
+PREFIX="${MHUB_PREFIX:-$APP_ROOT/prefix}"
+RUNTIME="$APP_ROOT/runtime"
+FONT_DIR="$APP_ROOT/fonts"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mhub-linux"
+MAIN_PORT="${MHUB_MAIN_PORT:-9229}"
+RENDERER_PORT="${MHUB_RENDERER_PORT:-9222}"
+BRIDGE_PID_FILE="$STATE_DIR/bridge.pid"
+
+mkdir -p "$STATE_DIR"
+
+find_app() {
+  local candidates=(
+    "$PREFIX/drive_c/Program Files/MCHOSE HUB/MCHOSE HUB.exe"
+    "$PREFIX/drive_c/Program Files (x86)/MCHOSE HUB/MCHOSE HUB.exe"
+    "$PREFIX/drive_c/users/$USER/AppData/Local/Programs/MCHOSE HUB/MCHOSE HUB.exe"
+  )
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  find "$PREFIX/drive_c" -maxdepth 7 -type f -iname 'MCHOSE HUB.exe' -print -quit 2>/dev/null
+}
+
+stop_bridge() {
+  if [[ ! -f "$BRIDGE_PID_FILE" ]]; then
+    return 0
+  fi
+
+  local pid
+  pid="$(cat "$BRIDGE_PID_FILE" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$BRIDGE_PID_FILE"
+}
+
+stop_all() {
+  stop_bridge
+  WINEPREFIX="$PREFIX" wineserver -k 2>/dev/null || true
+  printf 'Stopped M HUB and its runtime bridge.\n'
+}
+
+doctor() {
+  printf 'mhub-linux diagnostics\n\n'
+  printf 'App root:       %s\n' "$APP_ROOT"
+  printf 'Wine prefix:    %s\n' "$PREFIX"
+  printf 'Runtime:        %s\n' "$RUNTIME"
+  printf 'Font directory: %s\n' "$FONT_DIR"
+  printf 'Main port:      %s\n' "$MAIN_PORT"
+  printf 'Renderer port:  %s\n' "$RENDERER_PORT"
+  printf '\n'
+
+  local command
+  for command in wine wineserver node npm curl; do
+    if command -v "$command" >/dev/null 2>&1; then
+      printf '[ok]      %-12s %s\n' "$command" "$(command -v "$command")"
+    else
+      printf '[missing] %-12s\n' "$command"
+    fi
+  done
+
+  if command -v node >/dev/null 2>&1; then
+    printf '[info]    Node.js      %s\n' "$(node --version)"
+  fi
+  if command -v wine >/dev/null 2>&1; then
+    printf '[info]    Wine         %s\n' "$(wine --version 2>/dev/null || true)"
+  fi
+
+  local exe
+  exe="$(find_app || true)"
+  if [[ -n "$exe" ]]; then
+    printf '[ok]      M HUB        %s\n' "$exe"
+  else
+    printf '[missing] M HUB executable\n'
+  fi
+
+  local font
+  for font in iconfont.woff2 MiSans-Regular.woff2 MiSans-Semibold.woff2 MiSans-Bold.woff2; do
+    if [[ -s "$FONT_DIR/$font" ]]; then
+      printf '[ok]      font         %s\n' "$font"
+    else
+      printf '[missing] font         %s\n' "$font"
+    fi
+  done
+
+  if curl -fsS --max-time 1 "http://127.0.0.1:$MAIN_PORT/json/list" >/dev/null 2>&1; then
+    printf '[active]  main inspector on 127.0.0.1:%s\n' "$MAIN_PORT"
+  fi
+  if curl -fsS --max-time 1 "http://127.0.0.1:$RENDERER_PORT/json/list" >/dev/null 2>&1; then
+    printf '[active]  renderer inspector on 127.0.0.1:%s\n' "$RENDERER_PORT"
+  fi
+
+  printf '\nLogs:\n  %s\n  %s\n' "$STATE_DIR/bridge.log" "$STATE_DIR/wine.log"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: mhub-linux [options]
+
+Options:
+  --no-audio-shim   Do not replace cmedia_2025 with M HUB's fake SDK
+  --doctor          Print installation/runtime diagnostics
+  --stop            Stop M HUB and the bridge in this Wine prefix
+  -h, --help        Show this help
+
+Environment:
+  MHUB_HOME           installation root
+  MHUB_PREFIX         Wine prefix override
+  MHUB_MAIN_PORT      Node inspector port (default: 9229)
+  MHUB_RENDERER_PORT  Chromium debugging port (default: 9222)
+  MHUB_NO_PROXY=1     add --no-proxy-server to Chromium
+EOF
+}
+
+AUDIO_SHIM=1
+EXTRA_ARGS=()
+
+while (($#)); do
+  case "$1" in
+    --no-audio-shim)
+      AUDIO_SHIM=0
+      shift
+      ;;
+    --doctor)
+      doctor
+      exit 0
+      ;;
+    --stop)
+      stop_all
+      exit 0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+for required in wine wineserver node curl; do
+  if ! command -v "$required" >/dev/null 2>&1; then
+    printf 'mhub-linux: missing required command: %s\n' "$required" >&2
+    printf 'Run install.sh again.\n' >&2
+    exit 1
+  fi
+done
+
+if [[ ! -f "$RUNTIME/src/bridge.mjs" ]]; then
+  printf 'mhub-linux: runtime bridge is missing: %s\n' "$RUNTIME/src/bridge.mjs" >&2
+  printf 'Run install.sh again.\n' >&2
+  exit 1
+fi
+
+EXE="$(find_app || true)"
+if [[ -z "$EXE" ]]; then
+  printf 'mhub-linux: MCHOSE HUB.exe was not found in %s\n' "$PREFIX" >&2
+  printf 'Run install.sh again.\n' >&2
+  exit 1
+fi
+
+if curl -fsS --max-time 1 "http://127.0.0.1:$MAIN_PORT/json/list" >/dev/null 2>&1; then
+  printf 'mhub-linux: port %s is already in use by an inspector.\n' "$MAIN_PORT" >&2
+  printf 'If this is an old M HUB instance, run: mhub-linux --stop\n' >&2
+  exit 1
+fi
+
+stop_bridge
+
+BRIDGE_ARGS=(
+  --main-port "$MAIN_PORT"
+  --renderer-port "$RENDERER_PORT"
+  --font-dir "$FONT_DIR"
+)
+if [[ "$AUDIO_SHIM" -eq 0 ]]; then
+  BRIDGE_ARGS+=(--no-audio-shim)
+fi
+
+: > "$STATE_DIR/bridge.log"
+: > "$STATE_DIR/wine.log"
+
+nohup node "$RUNTIME/src/bridge.mjs" "${BRIDGE_ARGS[@]}" \
+  >> "$STATE_DIR/bridge.log" 2>&1 </dev/null &
+printf '%s\n' "$!" > "$BRIDGE_PID_FILE"
+
+CHROMIUM_ARGS=(
+  "--inspect-brk=$MAIN_PORT"
+  "--remote-debugging-port=$RENDERER_PORT"
+  --disable-quic
+  --disable-http2
+)
+
+if [[ "${MHUB_NO_PROXY:-0}" == "1" ]]; then
+  CHROMIUM_ARGS+=(--no-proxy-server)
+fi
+
+nohup env \
+  WINEPREFIX="$PREFIX" \
+  WINEDEBUG="${WINEDEBUG:--all}" \
+  wine "$EXE" \
+  "${CHROMIUM_ARGS[@]}" \
+  "${EXTRA_ARGS[@]}" \
+  >> "$STATE_DIR/wine.log" 2>&1 </dev/null &
+
+printf 'M HUB started.\n'
+printf 'Bridge log: %s\n' "$STATE_DIR/bridge.log"
+printf 'Wine log:   %s\n' "$STATE_DIR/wine.log"
