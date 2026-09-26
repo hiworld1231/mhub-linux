@@ -4,6 +4,10 @@ The `beta` branch is where the real Linux audio backend for MCHOSE headsets is b
 
 The current stable workaround keeps M HUB usable by replacing the failing `cmedia_2025` worker backend with M HUB's built-in fake SDK. That opens the V9 Pro UI, but the fake SDK only stores UI state. It does not process PipeWire audio.
 
+## Current beta notes
+
+The experimental pre-creation Electron tray-window patch was reverted after it caused a renderer regression under Wine. Tray background/position work is being kept separate from the main compatibility bridge until it is verified not to affect the primary M HUB window.
+
 The beta work has two stages:
 
 1. record the exact SDK IPC emitted by M HUB for every V9 Pro control;
@@ -11,40 +15,16 @@ The beta work has two stages:
 
 ## Capture V9 Pro SDK traffic
 
-The tracer does **not** launch M HUB. Start M HUB first, leave the V9 Pro page closed, then start the tracer in a second terminal.
+Start M HUB normally with `mhub-linux`, but do not open the V9 Pro page yet.
 
-### Using an existing Wine prefix
-
-If M HUB is already installed in a prefix such as `~/.wine-mchose-test`, install the beta runtime without reinstalling M HUB:
+From a clone of this branch:
 
 ```bash
 git clone -b beta https://github.com/hiworld1231/mhub-linux.git
 cd mhub-linux
-MHUB_PREFIX="$HOME/.wine-mchose-test" ./install.sh --skip-hub --skip-packages
-```
-
-Start M HUB:
-
-```bash
-MHUB_PREFIX="$HOME/.wine-mchose-test" mhub-linux
-```
-
-Wait until the main M HUB window is visible. Do not open V9 Pro yet.
-
-In a second terminal:
-
-```bash
-cd ~/mhub-linux
+npm install
 node tools/sdk-trace.mjs --output v9-pro-sdk.jsonl
 ```
-
-A fresh session should normally print:
-
-```text
-[sdk-trace] hook: installed
-```
-
-`already-installed` means a trace hook is already present in the currently running M HUB main process, usually because a previous tracer session attached to the same process. Stop M HUB and start a fresh session if the window is missing or the state is unclear.
 
 Leave the tracer running. Open V9 Pro and change one control at a time. Wait about a second between changes so the resulting trace is easy to read.
 
@@ -67,7 +47,7 @@ Stop the tracer with Ctrl+C. The output is JSONL, one IPC message per line.
 
 ## What will be implemented first
 
-The first real backend target is the boring but useful stuff:
+The first real backend target is:
 
 - output volume and mute
 - microphone volume and mute
