@@ -24,3 +24,4 @@ jobs:
           node --check src/bridge.mjs
           node --check tools/sdk-trace.mjs
           node --check tools/ui-diagnose.mjs
+          node --check tools/ui-fix-live.mjs
