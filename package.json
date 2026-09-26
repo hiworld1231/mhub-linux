@@ -1,0 +1,13 @@
+{
+  "name": "mhub-linux-runtime",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Runtime bridge used by mhub-linux",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
