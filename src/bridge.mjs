@@ -26,7 +26,7 @@ function sleep(ms) {
 
 async function fetchJson(url) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1000);
+  const timer = setTimeout(() => controller.abort(), 1200);
   try {
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -46,7 +46,6 @@ class CDPClient {
 
   async connect() {
     this.ws = new WebSocket(this.url, { maxPayload: 64 * 1024 * 1024 });
-
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('WebSocket connect timeout')), 5000);
       this.ws.once('open', () => {
@@ -71,12 +70,8 @@ class CDPClient {
       const entry = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(entry.timer);
-
-      if (message.error) {
-        entry.reject(new Error(message.error.message || JSON.stringify(message.error)));
-      } else {
-        entry.resolve(message.result);
-      }
+      if (message.error) entry.reject(new Error(message.error.message || JSON.stringify(message.error)));
+      else entry.resolve(message.result);
     });
 
     this.ws.on('close', () => {
@@ -95,232 +90,393 @@ class CDPClient {
         this.pending.delete(id);
         reject(new Error(`${method} timed out`));
       }, timeoutMs);
-
       this.pending.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify({ id, method, params }));
     });
   }
 
   async evaluate(expression, awaitPromise = false, timeoutMs = 30000) {
-    const result = await this.command(
+    const response = await this.command(
       'Runtime.evaluate',
-      {
-        expression,
-        returnByValue: true,
-        awaitPromise,
-      },
+      { expression, returnByValue: true, awaitPromise },
       timeoutMs,
     );
-
-    const value = result?.result;
-    if (value?.subtype === 'error') {
-      throw new Error(value.description || 'Runtime.evaluate failed');
-    }
-
+    const value = response?.result;
+    if (value?.subtype === 'error') throw new Error(value.description || 'Runtime.evaluate failed');
     return value?.value;
   }
 
   close() {
-    try {
-      this.ws?.close();
-    } catch {
-      // Ignore close races.
-    }
+    try { this.ws?.close(); } catch {}
   }
 }
 
-const audioHookExpression = String.raw`
-(() => {
-  if (globalThis.__mhubLinuxAudioHookInstalled) return 'already-installed';
+function mainRuntimePatch(enableAudioShim) {
+  const result = { audioShim: 'disabled', windowPatch: 'already-installed' };
 
-  const cp = process.getBuiltinModule('child_process');
-  const proto = cp.ChildProcess && cp.ChildProcess.prototype;
-  const originalSpawn = proto && proto.spawn;
+  if (enableAudioShim && !globalThis.__mhubLinuxAudioHookInstalled) {
+    const cp = process.getBuiltinModule('child_process');
+    const proto = cp.ChildProcess && cp.ChildProcess.prototype;
+    const originalSpawn = proto && proto.spawn;
 
-  if (typeof originalSpawn !== 'function') {
-    return 'error: ChildProcess.prototype.spawn unavailable';
+    if (typeof originalSpawn === 'function') {
+      function rewrite(value, seen = new Set()) {
+        if (!value || typeof value !== 'object' || seen.has(value)) return false;
+        seen.add(value);
+        let changed = false;
+        try {
+          if (value.sdkType === 'cmedia_2025') {
+            value.sdkType = 'fake';
+            changed = true;
+          }
+          for (const key of Object.keys(value)) {
+            if (rewrite(value[key], seen)) changed = true;
+          }
+        } catch {}
+        return changed;
+      }
+
+      function wrapSend(child) {
+        if (!child || child.__mhubLinuxSendWrapped || typeof child.send !== 'function') return;
+        const originalSend = child.send;
+        child.send = function(message, ...rest) {
+          if (rewrite(message)) console.log('[mhub-linux] rewrote audio worker sdkType: cmedia_2025 -> fake');
+          return originalSend.call(this, message, ...rest);
+        };
+        child.__mhubLinuxSendWrapped = true;
+      }
+
+      proto.spawn = function(options) {
+        const spawnResult = originalSpawn.call(this, options);
+        wrapSend(this);
+        return spawnResult;
+      };
+
+      const originalFork = cp.fork;
+      if (typeof originalFork === 'function') {
+        cp.fork = function(...forkArgs) {
+          const child = originalFork.apply(this, forkArgs);
+          wrapSend(child);
+          return child;
+        };
+      }
+
+      globalThis.__mhubLinuxAudioHookInstalled = true;
+      result.audioShim = 'installed';
+    } else {
+      result.audioShim = 'spawn-unavailable';
+    }
+  } else if (enableAudioShim) {
+    result.audioShim = 'already-installed';
   }
 
-  function rewrite(value, seen = new Set()) {
-    if (!value || typeof value !== 'object' || seen.has(value)) return false;
-    seen.add(value);
-
-    let changed = false;
-
+  if (!globalThis.__mhubLinuxElectronWindowPatchInstalled) {
     try {
-      if (value.sdkType === 'cmedia_2025') {
-        value.sdkType = 'fake';
-        changed = true;
+      const Module = process.getBuiltinModule('module');
+      const originalLoad = Module._load;
+      const proxyCache = new WeakMap();
+
+      function positionNearCursor(win, electron) {
+        try {
+          const screen = electron && electron.screen;
+          if (!screen || typeof screen.getCursorScreenPoint !== 'function') return false;
+          const point = screen.getCursorScreenPoint();
+          const display = typeof screen.getDisplayNearestPoint === 'function'
+            ? screen.getDisplayNearestPoint(point)
+            : null;
+          const area = (display && (display.workArea || display.bounds)) || null;
+          if (!area) return false;
+
+          const bounds = win.getBounds();
+          const gap = 10;
+          const rightHalf = point.x >= area.x + area.width / 2;
+          const bottomHalf = point.y >= area.y + area.height / 2;
+          let x = rightHalf ? point.x - bounds.width - gap : point.x + gap;
+          let y = bottomHalf ? point.y - bounds.height - gap : point.y + gap;
+          x = Math.max(area.x, Math.min(x, area.x + area.width - bounds.width));
+          y = Math.max(area.y, Math.min(y, area.y + area.height - bounds.height));
+
+          const setter = win.__mhubLinuxOriginalSetPosition || win.setPosition.bind(win);
+          setter(Math.round(x), Math.round(y), false);
+          return true;
+        } catch {
+          return false;
+        }
       }
 
-      for (const key of Object.keys(value)) {
-        if (rewrite(value[key], seen)) changed = true;
-      }
-    } catch {}
+      function installTrayBehavior(win, electron) {
+        if (!win || win.__mhubLinuxTrayBehaviorInstalled) return;
+        win.__mhubLinuxTrayBehaviorInstalled = true;
+        win.__mhubLinuxTrayWindow = true;
 
-    return changed;
+        try { win.setBackgroundColor('#151515'); } catch {}
+        try { if (typeof win.setOpacity === 'function') win.setOpacity(1); } catch {}
+
+        if (typeof win.setPosition === 'function') {
+          const originalSetPosition = win.setPosition.bind(win);
+          win.__mhubLinuxOriginalSetPosition = originalSetPosition;
+          win.setPosition = function(x, y, animate) {
+            if (this.__mhubLinuxTrayWindow && Number(x) <= 2 && Number(y) <= 2) {
+              if (positionNearCursor(this, electron)) return;
+            }
+            return originalSetPosition(x, y, animate);
+          };
+        }
+
+        if (typeof win.show === 'function') {
+          const originalShow = win.show.bind(win);
+          win.show = function(...showArgs) {
+            try { this.setBackgroundColor('#151515'); } catch {}
+            positionNearCursor(this, electron);
+            const value = originalShow(...showArgs);
+            setTimeout(() => positionNearCursor(this, electron), 0);
+            return value;
+          };
+        }
+
+        if (typeof win.showInactive === 'function') {
+          const originalShowInactive = win.showInactive.bind(win);
+          win.showInactive = function(...showArgs) {
+            try { this.setBackgroundColor('#151515'); } catch {}
+            positionNearCursor(this, electron);
+            const value = originalShowInactive(...showArgs);
+            setTimeout(() => positionNearCursor(this, electron), 0);
+            return value;
+          };
+        }
+
+        try {
+          win.on('show', () => {
+            setTimeout(() => positionNearCursor(win, electron), 0);
+            setTimeout(() => positionNearCursor(win, electron), 50);
+          });
+        } catch {}
+      }
+
+      function patchElectron(electron) {
+        if (!electron || (typeof electron !== 'object' && typeof electron !== 'function')) return electron;
+        if (proxyCache.has(electron)) return proxyCache.get(electron);
+
+        const OriginalBrowserWindow = electron.BrowserWindow;
+        if (typeof OriginalBrowserWindow !== 'function') return electron;
+
+        class BrowserWindowCompat extends OriginalBrowserWindow {
+          constructor(options = {}) {
+            const source = options && typeof options === 'object' ? options : {};
+            const width = Number(source.width) || 0;
+            const height = Number(source.height) || 0;
+            const compact = (!width || width <= 600) && (!height || height <= 600);
+            const likelyTray = source.transparent === true && compact;
+            const next = { ...source };
+
+            if (likelyTray) {
+              next.transparent = false;
+              next.backgroundColor = '#151515';
+            }
+
+            super(next);
+            if (likelyTray) installTrayBehavior(this, electron);
+
+            try {
+              this.webContents.on('did-finish-load', () => {
+                let url = '';
+                try { url = this.webContents.getURL(); } catch {}
+                if (/\/tray\.html(?:$|[?#])/.test(url)) installTrayBehavior(this, electron);
+              });
+            } catch {}
+          }
+        }
+
+        const proxy = new Proxy(electron, {
+          get(target, prop, receiver) {
+            if (prop === 'BrowserWindow') return BrowserWindowCompat;
+            return Reflect.get(target, prop, receiver);
+          },
+        });
+        proxyCache.set(electron, proxy);
+        return proxy;
+      }
+
+      Module._load = function(request, parent, isMain) {
+        const exported = originalLoad.call(this, request, parent, isMain);
+        return request === 'electron' ? patchElectron(exported) : exported;
+      };
+
+      globalThis.__mhubLinuxElectronWindowPatchInstalled = true;
+      globalThis.__mhubLinuxOriginalModuleLoad = originalLoad;
+      result.windowPatch = 'installed';
+    } catch (error) {
+      result.windowPatch = `error: ${String(error && (error.stack || error))}`;
+    }
   }
 
-  function wrapSend(child) {
-    if (!child || child.__mhubLinuxSendWrapped) return;
-    if (typeof child.send !== 'function') return;
+  return result;
+}
 
-    const originalSend = child.send;
-    child.send = function(message, ...rest) {
-      if (rewrite(message)) {
-        console.log('[mhub-linux] rewrote audio worker sdkType: cmedia_2025 -> fake');
-      }
-      return originalSend.call(this, message, ...rest);
-    };
+function loadFonts() {
+  if (!fontDir) return [];
+  const definitions = [
+    ['iconfont', '400', 'iconfont.woff2', true],
+    ['MiSans', '400', 'MiSans-Regular.woff2', true],
+    ['MiSans', '600', 'MiSans-Semibold.woff2', true],
+    ['MiSans', '700', 'MiSans-Bold.woff2', true],
+    ['Unifont', '400', 'Unifont.ttf', false],
+    ['UnifontPixel', '400', 'Rubik-Bold.ttf', false],
+  ];
 
-    child.__mhubLinuxSendWrapped = true;
+  const fonts = [];
+  for (const [family, weight, fileName, required] of definitions) {
+    const filePath = path.join(fontDir, fileName);
+    if (!fs.existsSync(filePath)) {
+      if (required) log(`font missing: ${filePath}`);
+      continue;
+    }
+    fonts.push({ family, weight, b64: fs.readFileSync(filePath).toString('base64') });
+  }
+  return fonts;
+}
+
+async function rendererRuntimePatch(fonts) {
+  if (!globalThis.document || !document.documentElement || !document.head) {
+    return { status: 'not-ready' };
   }
 
-  proto.spawn = function(options) {
-    const result = originalSpawn.call(this, options);
-    wrapSend(this);
-    return result;
+  const isTray = document.title === 'M HUB - Tray' || /\/tray\.html(?:$|[?#])/.test(location.href);
+  const loaded = [];
+
+  if (!globalThis.__mhubLinuxFontsInstalled && Array.isArray(fonts) && fonts.length) {
+    function decodeBase64(value) {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    for (const font of fonts) {
+      try {
+        const face = new FontFace(font.family, decodeBase64(font.b64), {
+          weight: font.weight,
+          style: 'normal',
+        });
+        await face.load();
+        document.fonts.add(face);
+        loaded.push(`${font.family}:${font.weight}`);
+      } catch {}
+    }
+    globalThis.__mhubLinuxFontsInstalled = true;
+  }
+
+  function repairIconClasses(root = document) {
+    let repaired = 0;
+    const nodes = root.querySelectorAll ? root.querySelectorAll('.iconfont') : [];
+    for (const el of nodes) {
+      for (const name of [...el.classList]) {
+        if (/^icon-.*_linea$/.test(name)) {
+          const fixed = `${name}r`;
+          if (!el.classList.contains(fixed)) {
+            el.classList.add(fixed);
+            repaired += 1;
+          }
+        }
+      }
+    }
+    return repaired;
+  }
+
+  let style = document.getElementById('mhub-linux-ui-fix');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = 'mhub-linux-ui-fix';
+    document.head.appendChild(style);
+  }
+
+  style.textContent = `
+    .iconfont,
+    .iconfont::before,
+    .iconfont::after,
+    [class^="icon-"],
+    [class^="icon-"]::before,
+    [class^="icon-"]::after,
+    [class*=" icon-"],
+    [class*=" icon-"]::before,
+    [class*=" icon-"]::after {
+      font-family: iconfont !important;
+    }
+
+    html, body {
+      font-family: MiSans, "PingFang SC", Helvetica, Arial, sans-serif;
+      color-scheme: dark;
+    }
+
+    ${isTray ? `
+      html, body, #tray-app, .tray-body, .tray-top, .tray-bottom {
+        background: #151515 !important;
+        background-color: #151515 !important;
+        color-scheme: dark !important;
+      }
+    ` : ''}
+  `;
+
+  const repaired = repairIconClasses(document);
+
+  if (!globalThis.__mhubLinuxUiObserver) {
+    globalThis.__mhubLinuxUiObserver = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node && node.nodeType === 1) repairIconClasses(node);
+        }
+      }
+    });
+    globalThis.__mhubLinuxUiObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  const failureText = String(document.body?.innerText || '');
+  const loadFailed = /Загрузка не удалась|Load failed|Failed to load|加载失败|載入失敗/i.test(failureText);
+  let retry = null;
+
+  if (loadFailed && !globalThis.__mhubLinuxReloadScheduled) {
+    const key = 'mhub-linux-network-retry';
+    let count = 0;
+    try { count = Number(sessionStorage.getItem(key) || '0') || 0; } catch {}
+    if (count < 4) {
+      const delays = [1200, 2500, 5000, 9000];
+      const delay = delays[Math.min(count, delays.length - 1)];
+      try { sessionStorage.setItem(key, String(count + 1)); } catch {}
+      globalThis.__mhubLinuxReloadScheduled = true;
+      retry = { attempt: count + 1, delay };
+      setTimeout(() => location.reload(), delay);
+    }
+  } else if (!loadFailed) {
+    setTimeout(() => {
+      try { sessionStorage.removeItem('mhub-linux-network-retry'); } catch {}
+    }, 10000);
+  }
+
+  return {
+    status: 'patched',
+    title: document.title,
+    isTray,
+    repairedIconClasses: repaired,
+    loadedFonts: loaded,
+    loadFailed,
+    retry,
   };
-
-  const originalFork = cp.fork;
-  if (typeof originalFork === 'function') {
-    cp.fork = function(...forkArgs) {
-      const child = originalFork.apply(this, forkArgs);
-      wrapSend(child);
-      return child;
-    };
-  }
-
-  globalThis.__mhubLinuxAudioHookInstalled = true;
-  return 'installed';
-})()
-`;
+}
 
 async function findMainTarget() {
   const list = await fetchJson(`http://127.0.0.1:${mainPort}/json/list`);
   return list.find((item) => item.webSocketDebuggerUrl) || null;
 }
 
-async function installMainHookAndResume(target) {
+async function installMainPatchAndResume(target) {
   const client = new CDPClient(target.webSocketDebuggerUrl);
   await client.connect();
-
   try {
     await client.command('Runtime.enable');
-
-    if (audioShim) {
-      const result = await client.evaluate(audioHookExpression, false);
-      log(`audio compatibility hook: ${result}`);
-    } else {
-      log('audio compatibility hook disabled');
-    }
-
-    // The launcher uses --inspect-brk so the hook is installed before M HUB's
-    // main bundle creates the SDK worker. Always resume even if the shim is off.
+    const expression = `(${mainRuntimePatch.toString()})(${JSON.stringify(audioShim)})`;
+    const result = await client.evaluate(expression, false);
+    log(`main compatibility patch: ${JSON.stringify(result)}`);
     await client.command('Runtime.runIfWaitingForDebugger').catch(() => {});
-  } finally {
-    client.close();
-  }
-}
-
-function loadFonts() {
-  if (!fontDir) return null;
-
-  const definitions = [
-    ['iconfont', '400', 'iconfont.woff2'],
-    ['MiSans', '400', 'MiSans-Regular.woff2'],
-    ['MiSans', '600', 'MiSans-Semibold.woff2'],
-    ['MiSans', '700', 'MiSans-Bold.woff2'],
-  ];
-
-  const fonts = [];
-  for (const [family, weight, fileName] of definitions) {
-    const filePath = path.join(fontDir, fileName);
-    if (!fs.existsSync(filePath)) {
-      log(`font missing: ${filePath}`);
-      return null;
-    }
-
-    fonts.push({
-      family,
-      weight,
-      b64: fs.readFileSync(filePath).toString('base64'),
-    });
-  }
-
-  return fonts;
-}
-
-function makeFontInjectionExpression(fonts) {
-  return `
-(async () => {
-  if (globalThis.__mhubLinuxFontsInstalled) return 'already-installed';
-  if (!globalThis.document || !document.head) return 'not-ready';
-
-  const fonts = ${JSON.stringify(fonts)};
-
-  function decodeBase64(value) {
-    const binary = atob(value);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  }
-
-  for (const font of fonts) {
-    const face = new FontFace(
-      font.family,
-      decodeBase64(font.b64),
-      { weight: font.weight, style: 'normal' },
-    );
-    await face.load();
-    document.fonts.add(face);
-  }
-
-  let style = document.getElementById('mhub-linux-font-fix');
-  if (style) style.remove();
-
-  style = document.createElement('style');
-  style.id = 'mhub-linux-font-fix';
-  style.textContent = \`
-    .iconfont,
-    [class^="icon-"],
-    [class*=" icon-"] {
-      font-family: iconfont !important;
-    }
-
-    html, body {
-      font-family: MiSans, "PingFang SC", Helvetica, Arial, sans-serif;
-    }
-  \`;
-  document.head.appendChild(style);
-
-  await document.fonts.ready;
-  globalThis.__mhubLinuxFontsInstalled = true;
-
-  return {
-    iconfont: document.fonts.check('16px iconfont'),
-    misans400: document.fonts.check('400 16px MiSans'),
-    misans600: document.fonts.check('600 16px MiSans'),
-    misans700: document.fonts.check('700 16px MiSans'),
-  };
-})()
-`;
-}
-
-async function injectFontsIntoTarget(target, fonts) {
-  const client = new CDPClient(target.webSocketDebuggerUrl);
-  await client.connect();
-
-  try {
-    await client.command('Runtime.enable');
-    const already = await client.evaluate('globalThis.__mhubLinuxFontsInstalled === true');
-    if (already) return false;
-
-    const result = await client.evaluate(makeFontInjectionExpression(fonts), true, 60000);
-    if (result === 'not-ready') return false;
-
-    log(`fonts injected: ${target.type} ${target.title || target.url}`);
-    return true;
   } finally {
     client.close();
   }
@@ -335,31 +491,37 @@ async function rendererTargets() {
   });
 }
 
+async function patchRendererTarget(target, fonts) {
+  const client = new CDPClient(target.webSocketDebuggerUrl);
+  await client.connect();
+  try {
+    await client.command('Runtime.enable');
+    const expression = `(${rendererRuntimePatch.toString()})(${JSON.stringify(fonts)})`;
+    return await client.evaluate(expression, true, 60000);
+  } finally {
+    client.close();
+  }
+}
+
 async function main() {
   log(`bridge starting (main=${mainPort}, renderer=${rendererPort}, audioShim=${audioShim})`);
 
   const deadline = Date.now() + startupTimeoutMs;
   let mainTarget = null;
-
   while (Date.now() < deadline) {
     try {
       mainTarget = await findMainTarget();
       if (mainTarget) break;
-    } catch {
-      // Inspector is not listening yet.
-    }
+    } catch {}
     await sleep(100);
   }
 
-  if (!mainTarget) {
-    throw new Error(`M HUB main inspector did not appear on port ${mainPort}`);
-  }
+  if (!mainTarget) throw new Error(`M HUB main inspector did not appear on port ${mainPort}`);
 
   try {
-    await installMainHookAndResume(mainTarget);
+    await installMainPatchAndResume(mainTarget);
   } catch (error) {
-    // A failed shim must never leave M HUB permanently paused at --inspect-brk.
-    log(`main hook failed: ${error.message}`);
+    log(`main patch failed: ${error.message}`);
     try {
       const rescue = new CDPClient(mainTarget.webSocketDebuggerUrl);
       await rescue.connect();
@@ -369,9 +531,10 @@ async function main() {
   }
 
   const fonts = loadFonts();
-  if (!fonts) log('font injection disabled because one or more local font files are missing');
+  if (!fonts.length) log('no local fonts available; renderer font injection disabled');
 
   let missedMainChecks = 0;
+  const reported = new Map();
 
   while (true) {
     try {
@@ -386,20 +549,21 @@ async function main() {
       return;
     }
 
-    if (fonts) {
-      try {
-        const targets = await rendererTargets();
-        for (const target of targets) {
-          try {
-            await injectFontsIntoTarget(target, fonts);
-          } catch (error) {
-            log(`font injection retry for ${target.title || target.url}: ${error.message}`);
+    try {
+      const targets = await rendererTargets();
+      for (const target of targets) {
+        try {
+          const result = await patchRendererTarget(target, fonts);
+          const signature = JSON.stringify(result);
+          if (reported.get(target.id) !== signature) {
+            log(`renderer patch: ${target.type} ${target.title || target.url}: ${signature}`);
+            reported.set(target.id, signature);
           }
+        } catch (error) {
+          log(`renderer patch retry for ${target.title || target.url}: ${error.message}`);
         }
-      } catch {
-        // Renderer debugging port is not ready yet, or the renderer is reloading.
       }
-    }
+    } catch {}
 
     await sleep(1500);
   }
