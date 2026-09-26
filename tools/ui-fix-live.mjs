@@ -90,19 +90,22 @@ class CDPClient {
   }
 }
 
-const patchExpression = String.raw`
-(() => {
+function pagePatch() {
   if (!globalThis.document || !document.documentElement) return { status: 'not-ready' };
 
   const isTray = document.title === 'M HUB - Tray' || /\/tray\.html(?:$|[?#])/.test(location.href);
 
   function repairIconClasses(root = document) {
     let repaired = 0;
-    const nodes = root.querySelectorAll ? root.querySelectorAll('.iconfont') : [];
+    const nodes = [];
+
+    if (root?.matches?.('.iconfont')) nodes.push(root);
+    if (root?.querySelectorAll) nodes.push(...root.querySelectorAll('.iconfont'));
+
     for (const el of nodes) {
       for (const name of [...el.classList]) {
         if (/^icon-.*_linea$/.test(name)) {
-          const fixed = name + 'r';
+          const fixed = `${name}r`;
           if (!el.classList.contains(fixed)) {
             el.classList.add(fixed);
             repaired += 1;
@@ -120,27 +123,26 @@ const patchExpression = String.raw`
     document.head?.appendChild(style);
   }
 
-  style.textContent = isTray ? \`
-    html,
-    body,
-    #tray-app,
-    .tray-body {
-      background: #151515 !important;
-      background-color: #151515 !important;
-      color-scheme: dark !important;
-    }
-
-    html,
-    body {
-      width: 100% !important;
-      min-height: 100% !important;
-    }
-  \` : \`
-    html[theme-mode="dark"],
-    html[theme-mode="dark"] body {
-      color-scheme: dark !important;
-    }
-  \`;
+  if (isTray) {
+    style.textContent = [
+      'html, body, #tray-app, .tray-body, .tray-top, .tray-bottom {',
+      '  background: #151515 !important;',
+      '  background-color: #151515 !important;',
+      '  color-scheme: dark !important;',
+      '}',
+      'html, body {',
+      '  width: 100% !important;',
+      '  min-height: 100% !important;',
+      '}',
+    ].join('\n');
+  } else {
+    style.textContent = [
+      'html[theme-mode="dark"],',
+      'html[theme-mode="dark"] body {',
+      '  color-scheme: dark !important;',
+      '}',
+    ].join('\n');
+  }
 
   const repaired = repairIconClasses(document);
 
@@ -148,10 +150,7 @@ const patchExpression = String.raw`
     globalThis.__mhubLinuxBetaUiObserver = new MutationObserver((records) => {
       for (const record of records) {
         for (const node of record.addedNodes) {
-          if (node?.nodeType === 1) {
-            if (node.matches?.('.iconfont')) repairIconClasses(node.parentElement || document);
-            else repairIconClasses(node);
-          }
+          if (node?.nodeType === 1) repairIconClasses(node);
         }
       }
     });
@@ -166,19 +165,27 @@ const patchExpression = String.raw`
     let rules;
     try { rules = sheet.cssRules; } catch { continue; }
     if (!rules) continue;
+
     for (const rule of [...rules]) {
       if (rule.type !== CSSRule.FONT_FACE_RULE) continue;
+
       const family = rule.style.getPropertyValue('font-family').replace(/["']/g, '').trim();
+      const weight = rule.style.getPropertyValue('font-weight').trim() || '400';
       if (!family) continue;
-      const status = [...document.fonts]
-        .filter((face) => face.family.replace(/["']/g, '') === family)
-        .map((face) => face.status);
-      if (status.some((value) => value === 'error' || value === 'unloaded')) {
+
+      const matchingFaces = [...document.fonts].filter((face) => {
+        const faceFamily = face.family.replace(/["']/g, '');
+        return faceFamily === family && (String(face.weight) === weight || weight === 'normal');
+      });
+
+      const statuses = matchingFaces.map((face) => face.status);
+      if (statuses.length && !statuses.includes('loaded')) {
         unresolvedFontFaces.push({
           family,
+          weight,
           cssText: rule.cssText,
           sheet: sheet.href || null,
-          status,
+          status: statuses,
         });
       }
     }
@@ -194,8 +201,9 @@ const patchExpression = String.raw`
     bodyBackground: getComputedStyle(document.body).backgroundColor,
     htmlBackground: getComputedStyle(document.documentElement).backgroundColor,
   };
-})()
-`;
+}
+
+const patchExpression = `(${pagePatch.toString()})()`;
 
 async function patchTarget(target) {
   const client = new CDPClient(target.webSocketDebuggerUrl);
